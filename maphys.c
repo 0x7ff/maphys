@@ -13,13 +13,16 @@
 #define IPC_PORT_IP_KOBJECT_OFF (0x68)
 #define TASK_ITK_REGISTERED_OFF (0x2E8)
 #define VTAB_GET_EXTERNAL_TRAP_FOR_INDEX_OFF (0x5B8)
+#define VM_KERNEL_LINK_ADDRESS (0xFFFFFFF007004000ULL)
 
+#define ARM_PGSHIFT_4K (12U)
+#define ARM_PGSHIFT_16K (14U)
+#define KADDR_FMT "0x%" PRIx64
 #define RD(a) extract32(a, 0, 5)
 #define RN(a) extract32(a, 5, 5)
 #define BCOPY_PHYS_DST_PHYS (1U)
 #define BCOPY_PHYS_SRC_PHYS (2U)
 #define RM(a) extract32(a, 16, 5)
-#define KADDR_FMT "0x%016" PRIx64
 #define MAX_VTAB_SZ (ARM_PGBYTES)
 #define ARM_PGMASK (ARM_PGBYTES - 1U)
 #define IS_RET(a) ((a) == 0xD65F03C0U)
@@ -103,7 +106,7 @@ io_service_t
 IOServiceGetMatchingService(mach_port_t, CFDictionaryRef);
 
 kern_return_t
-IOServiceOpen(io_service_t, task_port_t, uint32_t type, io_connect_t *);
+IOServiceOpen(io_service_t, task_port_t, uint32_t, io_connect_t *);
 
 kern_return_t
 IOConnectTrap6(io_connect_t, uint32_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
@@ -137,12 +140,12 @@ init_arm_pgshift(void) {
 		switch(cpufamily) {
 			case CPUFAMILY_ARM_CYCLONE:
 			case CPUFAMILY_ARM_TYPHOON:
-				arm_pgshift = 12;
+				arm_pgshift = ARM_PGSHIFT_4K;
 				return KERN_SUCCESS;
 			case CPUFAMILY_ARM_TWISTER:
 			case CPUFAMILY_ARM_HURRICANE:
 			case CPUFAMILY_ARM_MONSOON_MISTRAL:
-				arm_pgshift = 14;
+				arm_pgshift = ARM_PGSHIFT_16K;
 				return KERN_SUCCESS;
 			default:
 				break;
@@ -160,7 +163,7 @@ init_tfp0(void) {
 	if(ret != KERN_SUCCESS) {
 		host = mach_host_self();
 		if(MACH_PORT_VALID(host)) {
-			printf("host: 0x%08" PRIx32 "\n", host);
+			printf("host: 0x%" PRIx32 "\n", host);
 			ret = host_get_special_port(host, HOST_LOCAL_NODE, 4, &tfp0);
 			mach_port_deallocate(mach_task_self(), host);
 		}
@@ -175,11 +178,15 @@ init_tfp0(void) {
 }
 
 static kaddr_t
-get_kbase(void) {
+get_kbase(kaddr_t *kslide) {
 	mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
 	task_dyld_info_data_t dyld_info;
 
-	return task_info(tfp0, TASK_DYLD_INFO, (task_info_t)&dyld_info, &cnt) == KERN_SUCCESS ? dyld_info.all_image_info_addr : 0;
+	if(task_info(tfp0, TASK_DYLD_INFO, (task_info_t)&dyld_info, &cnt) == KERN_SUCCESS) {
+		*kslide = dyld_info.all_image_info_size;
+		return VM_KERNEL_LINK_ADDRESS + *kslide;
+	}
+	return 0;
 }
 
 static kern_return_t
@@ -213,8 +220,8 @@ kread_buf_alloc(kaddr_t addr, mach_vm_size_t read_sz) {
 }
 
 static kern_return_t
-kread_addr(kaddr_t addr, kaddr_t *val) {
-	return kread_buf(addr, val, sizeof(*val));
+kread_addr(kaddr_t addr, kaddr_t *value) {
+	return kread_buf(addr, value, sizeof(*value));
 }
 
 static kern_return_t
@@ -236,8 +243,8 @@ kwrite_buf(kaddr_t addr, const void *buf, mach_msg_type_number_t sz) {
 }
 
 static kern_return_t
-kwrite_addr(kaddr_t addr, kaddr_t val) {
-	return kwrite_buf(addr, &val, sizeof(val));
+kwrite_addr(kaddr_t addr, kaddr_t value) {
+	return kwrite_buf(addr, &value, sizeof(value));
 }
 
 static kern_return_t
@@ -288,11 +295,11 @@ pfinder_init(pfinder_t *pfinder, kaddr_t kbase) {
 				if(!strncmp(sgp->segname, SEG_TEXT_EXEC, sizeof(sgp->segname)) && (sp = find_section(sgp, SECT_TEXT))) {
 					pfinder->sec_text_start = sp->addr;
 					pfinder->sec_text_sz = sp->size;
-					printf("sec_text_start: " KADDR_FMT ", sec_text_sz: 0x%016" PRIx64 "\n", pfinder->sec_text_start, pfinder->sec_text_sz);
+					printf("sec_text_start: " KADDR_FMT ", sec_text_sz: 0x%" PRIx64 "\n", pfinder->sec_text_start, pfinder->sec_text_sz);
 				} else if(!strncmp(sgp->segname, SEG_TEXT, sizeof(sgp->segname)) && (sp = find_section(sgp, SECT_CSTRING))) {
 					pfinder->sec_cstring_start = sp->addr;
 					pfinder->sec_cstring_sz = sp->size;
-					printf("sec_cstring_start: " KADDR_FMT ", sec_cstring_sz: 0x%016" PRIx64 "\n", pfinder->sec_cstring_start, pfinder->sec_cstring_sz);
+					printf("sec_cstring_start: " KADDR_FMT ", sec_cstring_sz: 0x%" PRIx64 "\n", pfinder->sec_cstring_start, pfinder->sec_cstring_sz);
 				}
 			}
 			if(pfinder->sec_text_sz && pfinder->sec_cstring_sz) {
@@ -391,8 +398,8 @@ pfinder_pmap_find_phys(pfinder_t pfinder) {
 
 	if(ref) {
 		for(i = (ref - pfinder.sec_text_start) / sizeof(*insn); i > 0; --i) {
-			if(IS_BL(insn[i])) {
-				return pfinder.sec_text_start + (i * sizeof(*insn)) + BL_IMM(insn[i]);
+			if(IS_MOV_X(insn[i]) && RD(insn[i]) == 1 && IS_BL(insn[i + 1])) {
+				return pfinder.sec_text_start + ((i + 1) * sizeof(*insn)) + BL_IMM(insn[i + 1]);
 			}
 		}
 	}
@@ -465,7 +472,7 @@ get_conn(const char *name) {
 	io_connect_t conn = IO_OBJECT_NULL;
 
 	if(MACH_PORT_VALID(serv)) {
-		printf("serv: 0x%08" PRIx32 "\n", serv);
+		printf("serv: 0x%" PRIx32 "\n", serv);
 		if(IOServiceOpen(serv, mach_task_self(), 0, &conn) != KERN_SUCCESS || !MACH_PORT_VALID(conn)) {
 			conn = IO_OBJECT_NULL;
 		}
@@ -506,7 +513,7 @@ kcall_init(void) {
 	kaddr_t our_task, ipc_port;
 
 	if((g_conn = get_conn("AppleKeyStore")) != IO_OBJECT_NULL) {
-		printf("g_conn: 0x%08" PRIx32 "\n", g_conn);
+		printf("g_conn: 0x%" PRIx32 "\n", g_conn);
 		if(find_task(getpid(), &our_task) == KERN_SUCCESS) {
 			printf("our_task: " KADDR_FMT "\n", our_task);
 			if((ipc_port = get_port(our_task, g_conn))) {
@@ -517,14 +524,16 @@ kcall_init(void) {
 						printf("orig_vtab: " KADDR_FMT "\n", orig_vtab);
 						if(kalloc(MAX_VTAB_SZ, &fake_vtab) == KERN_SUCCESS) {
 							printf("fake_vtab: " KADDR_FMT "\n", fake_vtab);
-							if(mach_vm_copy(tfp0, orig_vtab, MAX_VTAB_SZ, fake_vtab) == KERN_SUCCESS && kwrite_addr(fake_vtab + VTAB_GET_EXTERNAL_TRAP_FOR_INDEX_OFF, csblob_get_cdhash) == KERN_SUCCESS) {
-								return kwrite_addr(user_client, fake_vtab);
+							if(mach_vm_copy(tfp0, orig_vtab, MAX_VTAB_SZ, fake_vtab) == KERN_SUCCESS && kwrite_addr(fake_vtab + VTAB_GET_EXTERNAL_TRAP_FOR_INDEX_OFF, csblob_get_cdhash) == KERN_SUCCESS && kwrite_addr(user_client, fake_vtab) == KERN_SUCCESS) {
+								return KERN_SUCCESS;
 							}
+							kfree(fake_vtab, MAX_VTAB_SZ);
 						}
 					}
 				}
 			}
 		}
+		IOServiceClose(g_conn);
 	}
 	return KERN_FAILURE;
 }
@@ -636,20 +645,21 @@ phys_test(void) {
 
 int
 main(void) {
+	kaddr_t kbase, kslide;
 	kern_return_t ret;
 	pfinder_t pfinder;
-	kaddr_t kbase;
 
 	if(init_arm_pgshift() == KERN_SUCCESS) {
 		printf("arm_pgshift: %u\n", arm_pgshift);
 		if(init_tfp0() == KERN_SUCCESS) {
-			printf("tfp0: 0x%08" PRIx32 "\n", tfp0);
-			if((kbase = get_kbase())) {
+			printf("tfp0: 0x%" PRIx32 "\n", tfp0);
+			if((kbase = get_kbase(&kslide))) {
 				printf("kbase: " KADDR_FMT "\n", kbase);
+				printf("kslide: " KADDR_FMT "\n", kslide);
 				if(pfinder_init(&pfinder, kbase) == KERN_SUCCESS) {
-					if(pfinder_init_offsets(pfinder) == KERN_SUCCESS) {
-						if(kcall_init() == KERN_SUCCESS && kcall(&ret, csblob_get_cdhash, 1, USER_CLIENT_TRAP_OFF) == KERN_SUCCESS) {
-							printf("csblob_get_cdhash(USER_CLIENT_TRAP_OFF): 0x%08" PRIx32 "\n", ret);
+					if(pfinder_init_offsets(pfinder) == KERN_SUCCESS && kcall_init() == KERN_SUCCESS) {
+						if(kcall(&ret, csblob_get_cdhash, 1, USER_CLIENT_TRAP_OFF) == KERN_SUCCESS) {
+							printf("csblob_get_cdhash(USER_CLIENT_TRAP_OFF): 0x%" PRIx32 "\n", ret);
 							if(phys_init() == KERN_SUCCESS) {
 								phys_test();
 							}
