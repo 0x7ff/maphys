@@ -5,19 +5,23 @@
 
 #define PMAP_MIN_OFF (0x10)
 #define PMAP_MAX_OFF (0x18)
-#define TASK_MAP_OFF (0x20)
 #define PROC_TASK_OFF (0x10)
-#define PROC_P_PID_OFF (0x60)
 #define VM_MAP_PMAP_OFF (0x48)
 #define USER_CLIENT_TRAP_OFF (0x40)
 #define IPC_PORT_IP_KOBJECT_OFF (0x68)
-#define TASK_ITK_REGISTERED_OFF (0x2E8)
-#define VTAB_GET_EXTERNAL_TRAP_FOR_INDEX_OFF (0x5B8)
+#define CPU_DATA_CPU_EXC_VECTORS_OFF (0xE0)
 #define VM_KERNEL_LINK_ADDRESS (0xFFFFFFF007004000ULL)
+#define kCFCoreFoundationVersionNumber_iOS_13_0_b2 (1656)
+#define kCFCoreFoundationVersionNumber_iOS_13_0_b1 (1652.20)
+#define TASK_MAP_OFF (kCFCoreFoundationVersionNumber >= kCFCoreFoundationVersionNumber_iOS_13_0_b1 ? 0x28 : 0x20)
+#define PROC_P_PID_OFF (kCFCoreFoundationVersionNumber >= kCFCoreFoundationVersionNumber_iOS_13_0_b2 ? 0x68 : 0x60)
+#define TASK_ITK_REGISTERED_OFF (kCFCoreFoundationVersionNumber >= kCFCoreFoundationVersionNumber_iOS_13_0_b1 ? 0x308 : 0x2E8)
+#define VTAB_GET_EXTERNAL_TRAP_FOR_INDEX_OFF (kCFCoreFoundationVersionNumber >= kCFCoreFoundationVersionNumber_iOS_13_0_b1 ? 0x5C0 : 0x5B8)
 
 #define ARM_PGSHIFT_4K (12U)
 #define ARM_PGSHIFT_16K (14U)
 #define KADDR_FMT "0x%" PRIx64
+#define VM_KERN_MEMORY_CPU (9)
 #define RD(a) extract32(a, 0, 5)
 #define RN(a) extract32(a, 5, 5)
 #define BCOPY_PHYS_DST_PHYS (1U)
@@ -31,7 +35,7 @@
 #define ARM_PGBYTES (1U << arm_pgshift)
 #define IO_OBJECT_NULL ((io_object_t)0)
 #define ADD_X_IMM(a) extract32(a, 10, 12)
-#define FAULT_MAGIC (0x4455445564666477ULL)
+#define FAULT_MAGIC (0xAAAAAAAAAAAAAAAAULL)
 #define BL_IMM(a) (sextract64(a, 0, 26) << 2U)
 #define LDR_X_IMM(a) (sextract64(a, 5, 19) << 2U)
 #define IS_BL(a) (((a) & 0xFC000000U) == 0x94000000U)
@@ -42,6 +46,7 @@
 #define IS_LDR_X(a) (((a) & 0xFF000000U) == 0x58000000U)
 #define IS_MOV_X(a) (((a) & 0xFFE00000U) == 0xAA000000U)
 #define LDR_X_UNSIGNED_IMM(a) (extract32(a, 10, 12) << 3U)
+#define IS_MOV_W_ZHW(a) (((a) & 0xFFE00000U) == 0x52800000U)
 #define IS_STP_X_PRE_IDX(a) (((a) & 0xFFC00000U) == 0xA9800000U)
 #define IS_LDR_X_UNSIGNED_IMM(a) (((a) & 0xFFC00000U) == 0xF9400000U)
 #define ADR_IMM(a) ((sextract64(a, 5, 19) << 2U) | extract32(a, 29, 2))
@@ -92,6 +97,9 @@ mach_vm_read_overwrite(vm_map_t, mach_vm_address_t, mach_vm_size_t, mach_vm_addr
 
 kern_return_t
 mach_vm_machine_attribute(vm_map_t, mach_vm_address_t, mach_vm_size_t, vm_machine_attribute_t, vm_machine_attribute_val_t *);
+
+kern_return_t
+mach_vm_region(vm_map_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t, mach_msg_type_number_t *, mach_port_t *);
 
 kern_return_t
 mach_vm_deallocate(vm_map_t, mach_vm_address_t, mach_vm_size_t);
@@ -177,18 +185,6 @@ init_tfp0(void) {
 	return KERN_FAILURE;
 }
 
-static kaddr_t
-get_kbase(kaddr_t *kslide) {
-	mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
-	task_dyld_info_data_t dyld_info;
-
-	if(task_info(tfp0, TASK_DYLD_INFO, (task_info_t)&dyld_info, &cnt) == KERN_SUCCESS) {
-		*kslide = dyld_info.all_image_info_size;
-		return VM_KERNEL_LINK_ADDRESS + *kslide;
-	}
-	return 0;
-}
-
 static kern_return_t
 kread_buf(kaddr_t addr, void *buf, mach_vm_size_t sz) {
 	mach_vm_address_t p = (mach_vm_address_t)buf;
@@ -255,6 +251,43 @@ kalloc(mach_vm_size_t sz, kaddr_t *addr) {
 static kern_return_t
 kfree(kaddr_t addr, mach_vm_size_t sz) {
 	return mach_vm_deallocate(tfp0, addr, sz);
+}
+
+static kaddr_t
+get_kbase(kaddr_t *kslide) {
+	mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
+	vm_region_extended_info_data_t extended_info;
+	task_dyld_info_data_t dyld_info;
+	kaddr_t addr, cpu_exc_vectors;
+	mach_port_t obj_nm;
+	mach_vm_size_t sz;
+	uint32_t magic;
+
+	if(task_info(tfp0, TASK_DYLD_INFO, (task_info_t)&dyld_info, &cnt) == KERN_SUCCESS && dyld_info.all_image_info_size) {
+		*kslide = dyld_info.all_image_info_size;
+		return VM_KERNEL_LINK_ADDRESS + *kslide;
+	}
+	addr = 0;
+	cnt = VM_REGION_EXTENDED_INFO_COUNT;
+	while(mach_vm_region(tfp0, &addr, &sz, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&extended_info, &cnt, &obj_nm) == KERN_SUCCESS) {
+		mach_port_deallocate(mach_task_self(), obj_nm);
+		if(extended_info.user_tag == VM_KERN_MEMORY_CPU && extended_info.protection == VM_PROT_DEFAULT) {
+			if(kread_addr(addr + CPU_DATA_CPU_EXC_VECTORS_OFF, &cpu_exc_vectors) != KERN_SUCCESS || (cpu_exc_vectors & ARM_PGMASK)) {
+				break;
+			}
+			printf("cpu_exc_vectors: " KADDR_FMT "\n", cpu_exc_vectors);
+			do {
+				cpu_exc_vectors -= ARM_PGBYTES;
+				if(cpu_exc_vectors <= VM_KERNEL_LINK_ADDRESS || kread_buf(cpu_exc_vectors, &magic, sizeof(magic)) != KERN_SUCCESS) {
+					return 0;
+				}
+			} while(magic != MH_MAGIC_64);
+			*kslide = cpu_exc_vectors - VM_KERNEL_LINK_ADDRESS;
+			return cpu_exc_vectors;
+		}
+		addr += sz;
+	}
+	return 0;
 }
 
 static const struct section_64 *
@@ -407,6 +440,22 @@ pfinder_pmap_find_phys(pfinder_t pfinder) {
 }
 
 static kaddr_t
+pfinder_ml_nofault_copy(pfinder_t pfinder) {
+	kaddr_t ref = pfinder_xref_str(pfinder, "Kernel UUID: %s\n");
+	const uint32_t *insn = pfinder.sec_text;
+	size_t i;
+
+	if(ref) {
+		for(i = (ref - pfinder.sec_text_start) / sizeof(*insn); i > 0; --i) {
+			if(IS_MOV_W_ZHW(insn[i]) && RD(insn[i]) == 2 && IS_BL(insn[i + 1])) {
+				return pfinder.sec_text_start + ((i + 1) * sizeof(*insn)) + BL_IMM(insn[i + 1]);
+			}
+		}
+	}
+	return 0;
+}
+
+static kaddr_t
 pfinder_bcopy_phys(pfinder_t pfinder) {
 	kaddr_t ref = pfinder_xref_str(pfinder, "\"bcopy extends beyond copy windows\"");
 	const uint32_t *insn = pfinder.sec_text;
@@ -418,10 +467,11 @@ pfinder_bcopy_phys(pfinder_t pfinder) {
 				return pfinder.sec_text_start + (i * sizeof(*insn));
 			}
 		}
-	} else if((ref = pfinder_xref_str(pfinder, "\"mdevstrategy: sink address %016llX not mapped\\n\""))) {
+	} else if((ref = pfinder_ml_nofault_copy(pfinder))) {
+		printf("ml_nofault_copy: " KADDR_FMT "\n", ref);
 		for(i = (ref - pfinder.sec_text_start) / sizeof(*insn); i < (pfinder.sec_text_sz / sizeof(*insn)) - 1; ++i) {
 			if(IS_MOV_X(insn[i]) && RD(insn[i]) == 2 && IS_BL(insn[i + 1])) {
-				return pfinder.sec_text_start + (i * sizeof(*insn)) + BL_IMM(insn[i + 1]);
+				return pfinder.sec_text_start + ((i + 1) * sizeof(*insn)) + BL_IMM(insn[i + 1]);
 			}
 		}
 	}
