@@ -1,7 +1,6 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach-o/loader.h>
 #include <mach/mach.h>
-#include <sys/sysctl.h>
 
 #define PMAP_MIN_OFF (0x10)
 #define PMAP_MAX_OFF (0x18)
@@ -22,7 +21,7 @@
 #define TASK_ITK_REGISTERED_OFF (kCFCoreFoundationVersionNumber >= kCFCoreFoundationVersionNumber_iOS_13_0_b1 ? 0x308 : 0x2E8)
 #define VTAB_GET_EXTERNAL_TRAP_FOR_INDEX_OFF (kCFCoreFoundationVersionNumber >= kCFCoreFoundationVersionNumber_iOS_13_0_b1 ? 0x5C0 : 0x5B8)
 
-#define KADDR_FMT "0x%" PRIx64
+#define KADDR_FMT "0x%" PRIX64
 #define VM_KERN_MEMORY_CPU (9)
 #define RD(a) extract32(a, 0, 5)
 #define RN(a) extract32(a, 5, 5)
@@ -41,13 +40,12 @@
 #define IS_BL(a) (((a) & 0xFC000000U) == 0x94000000U)
 #define IS_ADR(a) (((a) & 0x9F000000U) == 0x10000000U)
 #define IS_ADRP(a) (((a) & 0x9F000000U) == 0x90000000U)
-#define IS_SUB_X(a) (((a) & 0xFFC00000U) == 0xD1000000U)
 #define IS_ADD_X(a) (((a) & 0xFFC00000U) == 0x91000000U)
 #define IS_LDR_X(a) (((a) & 0xFF000000U) == 0x58000000U)
 #define IS_MOV_X(a) (((a) & 0xFFE00000U) == 0xAA000000U)
 #define LDR_X_UNSIGNED_IMM(a) (extract32(a, 10, 12) << 3U)
 #define IS_MOV_W_ZHW(a) (((a) & 0xFFE00000U) == 0x52800000U)
-#define IS_STP_X_PRE_IDX(a) (((a) & 0xFFC00000U) == 0xA9800000U)
+#define IS_ADD_X_ZSHIFT(a) (((a) & 0xFFE00000U) == 0x8B000000U)
 #define IS_LDR_X_UNSIGNED_IMM(a) (((a) & 0xFFC00000U) == 0xF9400000U)
 #define ADR_IMM(a) ((sextract64(a, 5, 19) << 2U) | extract32(a, 29, 2))
 
@@ -147,7 +145,7 @@ init_tfp0(void) {
 	if(ret != KERN_SUCCESS) {
 		host = mach_host_self();
 		if(MACH_PORT_VALID(host)) {
-			printf("host: 0x%" PRIx32 "\n", host);
+			printf("host: 0x%" PRIX32 "\n", host);
 			ret = host_get_special_port(host, HOST_LOCAL_NODE, 4, &tfp0);
 			mach_port_deallocate(mach_task_self(), host);
 		}
@@ -182,7 +180,7 @@ static void *
 kread_buf_alloc(kaddr_t addr, mach_vm_size_t read_sz) {
 	void *buf = malloc(read_sz);
 
-	if(buf) {
+	if(buf != NULL) {
 		if(kread_buf(addr, buf, read_sz) == KERN_SUCCESS) {
 			return buf;
 		}
@@ -298,23 +296,23 @@ pfinder_init(pfinder_t *pfinder, kaddr_t kbase) {
 	void *ptr;
 
 	pfinder_reset(pfinder);
-	if(kread_buf(kbase, &mh64, sizeof(mh64)) == KERN_SUCCESS && mh64.magic == MH_MAGIC_64 && (ptr = kread_buf_alloc(kbase + sizeof(mh64), mh64.sizeofcmds))) {
+	if(kread_buf(kbase, &mh64, sizeof(mh64)) == KERN_SUCCESS && mh64.magic == MH_MAGIC_64 && (ptr = kread_buf_alloc(kbase + sizeof(mh64), mh64.sizeofcmds)) != NULL) {
 		sgp = (const struct segment_command_64 *)ptr;
 		for(i = 0; i < mh64.ncmds; ++i) {
 			if(sgp->cmd == LC_SEGMENT_64) {
-				if(!strncmp(sgp->segname, SEG_TEXT_EXEC, sizeof(sgp->segname)) && (sp = find_section(sgp, SECT_TEXT))) {
+				if(!strncmp(sgp->segname, SEG_TEXT_EXEC, sizeof(sgp->segname)) && (sp = find_section(sgp, SECT_TEXT)) != NULL) {
 					pfinder->sec_text_start = sp->addr;
 					pfinder->sec_text_sz = sp->size;
-					printf("sec_text_start: " KADDR_FMT ", sec_text_sz: 0x%" PRIx64 "\n", pfinder->sec_text_start, pfinder->sec_text_sz);
-				} else if(!strncmp(sgp->segname, SEG_TEXT, sizeof(sgp->segname)) && (sp = find_section(sgp, SECT_CSTRING))) {
+					printf("sec_text_start: " KADDR_FMT ", sec_text_sz: 0x%" PRIX64 "\n", pfinder->sec_text_start, pfinder->sec_text_sz);
+				} else if(!strncmp(sgp->segname, SEG_TEXT, sizeof(sgp->segname)) && (sp = find_section(sgp, SECT_CSTRING)) != NULL) {
 					pfinder->sec_cstring_start = sp->addr;
 					pfinder->sec_cstring_sz = sp->size;
-					printf("sec_cstring_start: " KADDR_FMT ", sec_cstring_sz: 0x%" PRIx64 "\n", pfinder->sec_cstring_start, pfinder->sec_cstring_sz);
+					printf("sec_cstring_start: " KADDR_FMT ", sec_cstring_sz: 0x%" PRIX64 "\n", pfinder->sec_cstring_start, pfinder->sec_cstring_sz);
 				}
 			}
 			if(pfinder->sec_text_sz && pfinder->sec_cstring_sz) {
-				if((pfinder->sec_text = kread_buf_alloc(pfinder->sec_text_start, pfinder->sec_text_sz))) {
-					if((pfinder->sec_cstring = kread_buf_alloc(pfinder->sec_cstring_start, pfinder->sec_cstring_sz))) {
+				if((pfinder->sec_text = kread_buf_alloc(pfinder->sec_text_start, pfinder->sec_text_sz)) != NULL) {
+					if((pfinder->sec_cstring = kread_buf_alloc(pfinder->sec_cstring_start, pfinder->sec_cstring_sz)) != NULL) {
 						ret = KERN_SUCCESS;
 					} else {
 						free(pfinder->sec_text);
@@ -434,21 +432,15 @@ pfinder_ml_nofault_copy(pfinder_t pfinder) {
 
 static kaddr_t
 pfinder_bcopy_phys(pfinder_t pfinder) {
-	kaddr_t ref = pfinder_xref_str(pfinder, "\"bcopy extends beyond copy windows\"");
+	kaddr_t ref = pfinder_ml_nofault_copy(pfinder);
 	const uint32_t *insn = pfinder.sec_text;
 	size_t i;
 
 	if(ref) {
-		for(i = (ref - pfinder.sec_text_start) / sizeof(*insn); i > 0; --i) {
-			if(RN(insn[i]) == 31 && ((IS_SUB_X(insn[i]) && RD(insn[i]) == 31) || IS_STP_X_PRE_IDX(insn[i]))) {
-				return pfinder.sec_text_start + (i * sizeof(*insn));
-			}
-		}
-	} else if((ref = pfinder_ml_nofault_copy(pfinder))) {
 		printf("ml_nofault_copy: " KADDR_FMT "\n", ref);
 		for(i = (ref - pfinder.sec_text_start) / sizeof(*insn); i < (pfinder.sec_text_sz / sizeof(*insn)) - 1; ++i) {
-			if(IS_MOV_X(insn[i]) && RD(insn[i]) == 2 && IS_BL(insn[i + 1])) {
-				return pfinder.sec_text_start + ((i + 1) * sizeof(*insn)) + BL_IMM(insn[i + 1]);
+			if(IS_BL(insn[i]) && IS_ADD_X_ZSHIFT(insn[i + 1])) {
+				return pfinder.sec_text_start + (i * sizeof(*insn)) + BL_IMM(insn[i]);
 			}
 		}
 	}
@@ -499,7 +491,7 @@ get_conn(const char *name) {
 	io_connect_t conn = IO_OBJECT_NULL;
 
 	if(MACH_PORT_VALID(serv)) {
-		printf("serv: 0x%" PRIx32 "\n", serv);
+		printf("serv: 0x%" PRIX32 "\n", serv);
 		if(IOServiceOpen(serv, mach_task_self(), 0, &conn) != KERN_SUCCESS || !MACH_PORT_VALID(conn)) {
 			conn = IO_OBJECT_NULL;
 		}
@@ -540,7 +532,7 @@ kcall_init(void) {
 	kaddr_t our_task, ipc_port;
 
 	if((g_conn = get_conn("AppleKeyStore")) != IO_OBJECT_NULL) {
-		printf("g_conn: 0x%" PRIx32 "\n", g_conn);
+		printf("g_conn: 0x%" PRIX32 "\n", g_conn);
 		if(find_task(getpid(), &our_task) == KERN_SUCCESS) {
 			printf("our_task: " KADDR_FMT "\n", our_task);
 			if((ipc_port = get_port(our_task, g_conn))) {
@@ -677,14 +669,14 @@ main(void) {
 	pfinder_t pfinder;
 
 	if(init_tfp0() == KERN_SUCCESS) {
-		printf("tfp0: 0x%" PRIx32 "\n", tfp0);
+		printf("tfp0: 0x%" PRIX32 "\n", tfp0);
 		if((kbase = get_kbase(&kslide))) {
 			printf("kbase: " KADDR_FMT "\n", kbase);
 			printf("kslide: " KADDR_FMT "\n", kslide);
 			if(pfinder_init(&pfinder, kbase) == KERN_SUCCESS) {
 				if(pfinder_init_offsets(pfinder) == KERN_SUCCESS && kcall_init() == KERN_SUCCESS) {
 					if(kcall(&ret, csblob_get_cdhash, 1, USER_CLIENT_TRAP_OFF) == KERN_SUCCESS) {
-						printf("csblob_get_cdhash(USER_CLIENT_TRAP_OFF): 0x%" PRIx32 "\n", ret);
+						printf("csblob_get_cdhash(USER_CLIENT_TRAP_OFF): 0x%" PRIX32 "\n", ret);
 						if(phys_init() == KERN_SUCCESS) {
 							phys_test();
 						}
